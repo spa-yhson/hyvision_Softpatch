@@ -2,16 +2,19 @@ import logging
 import os
 import pickle
 import tqdm
-
+import time
 import torch
+import torch.nn as nn
 import src.common as common
 import src.sampler as sampler
 import src.multi_variate_gaussian as multi_variate_gaussian
-
+from argparse import ArgumentParser, Namespace
 from sklearn.neighbors import LocalOutlierFactor
 import src.backbones as backbones
+from src.fod import FOD
 import torch.nn.functional as F
 import numpy as np
+from src.losses import kl_loss, entropy_loss
 
 # from torch_cluster import graclus_cluster
 
@@ -34,6 +37,8 @@ class SoftPatch(torch.nn.Module):
         patchsize=3,
         patchstride=1,
         anomaly_score_num_nn=1,
+        with_fod = False,
+        cur_class_name=None,
         featuresampler=sampler.ApproximateGreedyCoresetSampler(percentage=0.1, device=torch.device("cuda")),
         nn_method=common.FaissNN(False, 4),
             lof_k=5,
@@ -45,7 +50,7 @@ class SoftPatch(torch.nn.Module):
         self.backbone = backbone.to(device)
         self.layers_to_extract_from = layers_to_extract_from
         self.input_shape = input_shape
-
+        self.with_fod = with_fod # chgd
         self.device = device
         self.patch_maker = PatchMaker(patchsize, stride=patchstride)
 
@@ -91,6 +96,38 @@ class SoftPatch(torch.nn.Module):
         self.coreset_weight = None
         self.weight_method = weight_method
         self.soft_weight_flag = soft_weight_flag
+        
+        if self.with_fod:
+            models = []
+            feat_dims = [512, 1024]
+            self.seq_lens = [784, 196]
+            self.ws = [28, 14]  # feature map height/width
+            args = Namespace(batch_size=8, device=device, with_intra=True, with_inter=True, rfeatures_path='rfeatures_w50',\
+                class_name=cur_class_name, feature_levels=len(feat_dims), save_path='checkpoints', save_prefix='mvtec', num_epochs=100,\
+                    lr=0.0001, lambda1=0.5, lambda2=0.5) # args chgd here!
+            self.args = args
+            
+            for seq_len, in_channels, d_model in zip(self.seq_lens, feat_dims, [256, 512]):
+                model = FOD(seq_len=seq_len,
+                            in_channels=in_channels,
+                            out_channels=in_channels,
+                            d_model=d_model,
+                            n_heads=8,
+                            n_layers=3,
+                            args=args)
+                
+                print('One Model...Done')
+                models.append(model.to(args.device))
+                
+            self.fod_models = models
+            print('Creating Models...Done')
+            params = list(models[0].parameters())
+            for l in range(1, args.feature_levels):
+                params += list(models[l].parameters())  
+            self.optimizer = torch.optim.Adam(params, lr=self.args.lr)
+            self.l2_criterion = nn.MSELoss()
+            self.cos_criterion = nn.CosineSimilarity(dim=-1)
+        
 
     def embed(self, data):
         if isinstance(data, torch.utils.data.DataLoader):
@@ -104,20 +141,120 @@ class SoftPatch(torch.nn.Module):
             return features
         return self._embed(data)
 
-    def _embed(self, images, detach=True, provide_patch_shapes=False):
+    def _embed(self, images, detach=True, provide_patch_shapes=False, with_fod=False, train_steps=None):
         """Returns feature embeddings for images."""
-
         def _detach(features):
             if detach:
                 return [x.detach().cpu().numpy() for x in features]
             return features
 
         _ = self.forward_modules["feature_aggregator"].eval()
+        
+        
         with torch.no_grad():
-            features = self.forward_modules["feature_aggregator"](images)
-
+            # images: (8, 3, 224, 224)
+            features = self.forward_modules["feature_aggregator"](images) # [8, 512, 28, 28]) & [8, 1024, 14, 14]
+            
         features = [features[layer] for layer in self.layers_to_extract_from]
+        
+        # chgd        
+        if with_fod:
+            path = os.path.join(self.args.save_path, self.args.save_prefix)
+            if not os.path.exists(path):
+                os.makedirs(path)
+            
+            loss_rec_list, loss_intra_entropy_list, loss_inter_entropy_list = [], [], []
+            loss_corr_list, loss_target_list = [], []
+            
+            for model in self.fod_models:
+                model.train()
+            
+            for fl in range(self.args.feature_levels): # feature_levels = 2
+                m = torch.nn.AvgPool2d(3, 1, 1)
+                input = m(features[fl])
+                N, D, _, _ = input.shape
+                input = input.permute(0, 2, 3, 1).reshape(N, -1, D)
 
+                model = self.fod_models[fl]
+                output, intra_corrs, intra_targets, inter_corrs, inter_targets = model(input)
+            
+                if self.args.with_intra:
+                    loss_intra1, loss_intra2, loss_intra_entropy = 0.0, 0.0, 0.0
+                    for l in range(len(intra_targets)):
+                        L = intra_targets[l].shape[-1]
+                        norm_targets = (intra_targets[l] / torch.unsqueeze(torch.sum(intra_targets[l], dim=-1), dim=-1).repeat(1, 1, 1, L)).detach()
+                        # optimizing intra correlations
+                        loss_intra1 += torch.mean(kl_loss(norm_targets, intra_corrs[l])) + torch.mean(kl_loss(intra_corrs[l], norm_targets))
+                        
+                        norm_targets = intra_targets[l] / torch.unsqueeze(torch.sum(intra_targets[l], dim=-1), dim=-1).repeat(1, 1, 1, L)
+                        loss_intra2 += torch.mean(kl_loss(norm_targets, intra_corrs[l].detach())) + torch.mean(kl_loss(intra_corrs[l].detach(), norm_targets))
+                        
+                        loss_intra_entropy += torch.mean(entropy_loss(intra_corrs[l]))
+                    
+                    loss_intra1 = loss_intra1 / len(intra_targets)
+                    loss_intra2 = loss_intra2 / len(intra_targets)
+                    loss_intra_entropy = loss_intra_entropy / len(intra_targets)
+
+                if self.args.with_inter:
+                    loss_inter1, loss_inter2, loss_inter_entropy = 0.0, 0.0, 0.0
+                    for l in range(len(inter_targets)):
+                        L = inter_targets[l].shape[-1]
+                        norm_targets = (inter_targets[l] / torch.unsqueeze(torch.sum(inter_targets[l], dim=-1), dim=-1).repeat(1, 1, 1, L)).detach()
+                        # optimizing inter correlations
+                        loss_inter1 += torch.mean(kl_loss(norm_targets, inter_corrs[l])) + torch.mean(kl_loss(inter_corrs[l], norm_targets))
+                        
+                        norm_targets = inter_targets[l] / torch.unsqueeze(torch.sum(inter_targets[l], dim=-1), dim=-1).repeat(1, 1, 1, L)
+                        loss_inter2 += torch.mean(kl_loss(norm_targets, inter_corrs[l].detach())) + torch.mean(kl_loss(inter_corrs[l].detach(), norm_targets))
+
+                        loss_inter_entropy += torch.mean(entropy_loss(inter_corrs[l]))
+                    
+                    loss_inter1 = loss_inter1 / len(inter_targets)
+                    loss_inter2 = loss_inter2 / len(inter_targets)
+                    loss_inter_entropy = loss_inter_entropy / len(inter_targets)
+                
+                loss_rec = self.l2_criterion(output, input) + torch.mean(1 - self.cos_criterion(output, input)) # mse + cosine
+                
+                if self.args.with_intra and self.args.with_inter:  # patch-wise reconstruction + intra correlation + inter correlation
+                    loss1 = loss_rec + self.args.lambda1 * loss_intra2 - self.args.lambda1 * loss_inter2 
+                    loss2 = loss_rec - self.args.lambda1 * loss_intra1 - self.args.lambda2 * loss_intra_entropy + self.args.lambda1 * loss_inter1 + self.args.lambda2 * loss_inter_entropy 
+                elif self.args.with_intra:  # patch-wise reconstruction + intra correlation
+                    loss1 = loss_rec + self.args.lambda1 * loss_intra2  
+                    loss2 = loss_rec - self.args.lambda1 * loss_intra1 - self.args.lambda2 * loss_intra_entropy 
+                elif self.args.with_inter:  # patch-wise reconstruction + inter correlation
+                    loss1 = loss_rec - self.args.lambda1 * loss_inter2  
+                    loss2 = loss_rec + self.args.lambda1 * loss_inter1 + self.args.lambda2 * loss_inter_entropy 
+                else:  # only patch-wise reconstruction
+                    loss = loss_rec
+                    
+                loss_rec_list.append(loss_rec.item())
+                if self.args.with_intra and self.args.with_inter:
+                    loss_target_list.append((loss_intra2 - loss_inter2).item())
+                    loss_corr_list.append((-loss_intra1 + loss_inter1).item())
+                    loss_intra_entropy_list.append(loss_intra_entropy.item())
+                    loss_inter_entropy_list.append(loss_inter_entropy.item())
+                elif self.args.with_intra:
+                    loss_target_list.append((loss_intra2).item())
+                    loss_corr_list.append((-loss_intra1).item())
+                    loss_intra_entropy_list.append(loss_intra_entropy.item())
+                elif self.args.with_inter:
+                    loss_target_list.append((-loss_inter2).item())
+                    loss_corr_list.append((loss_inter1).item())
+                    loss_inter_entropy_list.append(loss_inter_entropy.item())
+
+                self.optimizer.zero_grad()
+                if not self.args.with_intra and not self.args.with_inter:  # only patch-wise reconstruction
+                    loss.backward()
+                else:
+                    # Two-stage optimization
+                    # loss1.requires_grad_(True) # chgd
+                    # loss2.requires_grad_(True) # chgd
+                    
+                    loss1.backward(retain_graph=True)
+                    loss2.backward()
+                self.optimizer.step()
+
+
+        # from here is original
         features = [
             self.patch_maker.patchify(x, return_spatial_info=True) for x in features
         ]
@@ -154,35 +291,66 @@ class SoftPatch(torch.nn.Module):
         # sized features, these are brought into the correct form here.
         features = self.forward_modules["preprocessing"](features)
         features = self.forward_modules["preadapt_aggregator"](features)
+        
+        if with_fod:
+            return _detach(features), loss_rec_list, loss_target_list, loss_corr_list, loss_intra_entropy_list, loss_inter_entropy_list
+            
+        else:
+            if provide_patch_shapes:
+                return _detach(features), patch_shapes
+            return _detach(features)
 
-        if provide_patch_shapes:
-            return _detach(features), patch_shapes
-        return _detach(features)
-
-    def fit(self, training_data):
+    def fit(self, training_data, with_fod=False):
         """
         This function computes the embeddings of the training data and fills the
         memory bank of SPADE.
-        """
-        self._fill_memory_bank(training_data)
+        """        
+        self._fill_memory_bank(training_data, with_fod)
+        
 
-    def _fill_memory_bank(self, input_data):
+    def _fill_memory_bank(self, input_data, with_fod=False):
         """Computes and sets the support features for SPADE."""
         _ = self.forward_modules.eval()
 
-        def _image_to_features(input_image):
-            with torch.no_grad():
+        def _image_to_features(input_image, train_steps=None):
+            if with_fod:
                 input_image = input_image.to(torch.float).to(self.device)
-                return self._embed(input_image)
+                return self._embed(input_image, with_fod=with_fod, train_steps=train_steps)
+            else:
+                with torch.no_grad():
+                    input_image = input_image.to(torch.float).to(self.device)
+                    return self._embed(input_image, with_fod=with_fod, train_steps=train_steps)
 
         features = []
-        with tqdm.tqdm(
-            input_data, desc="Computing support features...", leave=True
-        ) as data_iterator:
-            for image in data_iterator:
-                if isinstance(image, dict):
-                    image = image["image"]
-                features.append(_image_to_features(image))
+        
+        if with_fod:
+            num_epochs = 20
+            for epoch in range(num_epochs):
+                with tqdm.tqdm(
+                    input_data, desc="Computing support features...", leave=True
+                ) as data_iterator:
+                    
+                    for image in data_iterator:
+                        if isinstance(image, dict):
+                            image = image["image"]
+                        
+                        feat, loss_rec_list, loss_target_list, loss_corr_list, \
+                            loss_intra_entropy_list, loss_inter_entropy_list = _image_to_features(image, train_steps=len(data_iterator))
+                        features.append(feat)
+                        
+                    print(
+                    "Epoch: {0}, Steps: {1} | Rec Loss: {2:.7f} | Target Loss: {3:.7f} | Corr Loss: {4:.7f} | Intra Entropy: {5:.7f} | Inter Entropy: {6:.7f}".format(
+                        epoch + 1, len(data_iterator), np.average(loss_rec_list), np.average(loss_target_list), np.average(loss_corr_list), np.average(loss_intra_entropy_list), np.average(loss_inter_entropy_list)))
+                    
+                    
+        else: # original
+            with tqdm.tqdm(
+                input_data, desc="Computing support features...", leave=True
+            ) as data_iterator:
+                for image in data_iterator:
+                    if isinstance(image, dict):
+                        image = image["image"]
+                    features.append(_image_to_features(image))
 
         features = np.concatenate(features, axis=0)
 

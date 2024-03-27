@@ -59,6 +59,7 @@ def parse_args():
     parser.add_argument("--overlap", action='store_true')
     parser.add_argument("--noise_augmentation", action='store_true')
     parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--with_fod", action='store_true')
 
     args = parser.parse_args()
     return args
@@ -73,7 +74,7 @@ def get_dataloaders(args):
     overlap = args.overlap
     noise_augmentation = args.noise_augmentation
     fold = args.fold
-
+    with_fod = args.with_fod
 
     dataset_info = _DATASETS[args.dataset]
     dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
@@ -148,6 +149,7 @@ def get_dataloaders(args):
         dataloader_dict = {
             "training": train_dataloader,
             "testing": test_dataloader,
+            "with_fod":with_fod
         }
 
         dataloaders.append(dataloader_dict)
@@ -163,7 +165,7 @@ def get_sampler(sampler_name, sampling_ratio, device):
         return sampler.ApproximateGreedyCoresetSampler(sampling_ratio, device)
 
 
-def get_coreset(args, imagesize, sampler, device):
+def get_coreset(args, imagesize, sampler, device, with_fod=False):
     input_shape = (3, imagesize, imagesize)
     backbone_names = list(args.backbone_names)
     if len(backbone_names) > 1:
@@ -197,6 +199,8 @@ def get_coreset(args, imagesize, sampler, device):
             input_shape=input_shape,
             featuresampler=sampler,
             nn_method=nn_method,
+            with_fod=with_fod['with_fod'], # chgd
+            cur_class_name=with_fod['training'].name, #chgd
             LOF_k=args.lof_k,
             threshold=args.threshold,
             weight_method=args.weight_method,
@@ -241,11 +245,10 @@ def run(args):
         utils.fix_seeds(seed, device)
 
 
-
         with device_context:
             torch.cuda.empty_cache()
             sampler = get_sampler(args.sampler_name, args.sampling_ratio, device)
-            coreset_list = get_coreset(args, args.imagesize, sampler, device)
+            coreset_list = get_coreset(args, args.imagesize, sampler, device, with_fod=dataloaders) # chgd
             if len(coreset_list) > 1:
                 LOGGER.info(
                     "Utilizing Coreset Ensemble (N={}).".format(len(coreset_list))
@@ -259,7 +262,7 @@ def run(args):
                 )
                 # for epoch in range(20):
                 #     coreset._train(dataloaders["training"])
-                coreset.fit(dataloaders["training"])
+                coreset.fit(dataloaders["training"], dataloaders['with_fod']) # chgd
             train_end = time.time()
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
