@@ -4,12 +4,12 @@ import pickle
 import tqdm
 
 import torch
-import common
-import sampler
-import multi_variate_gaussian
+import src.common as common
+import src.sampler as sampler
+import src.multi_variate_gaussian as multi_variate_gaussian
 
 from sklearn.neighbors import LocalOutlierFactor
-import backbones
+import src.backbones as backbones
 import torch.nn.functional as F
 import numpy as np
 
