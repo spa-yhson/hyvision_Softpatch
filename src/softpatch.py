@@ -326,10 +326,11 @@ class SoftPatch(torch.nn.Module):
         if with_fod:
             num_epochs = 20
             for epoch in range(num_epochs):
+                features = []
+                
                 with tqdm.tqdm(
                     input_data, desc="Computing support features...", leave=True
                 ) as data_iterator:
-                    
                     for image in data_iterator:
                         if isinstance(image, dict):
                             image = image["image"]
