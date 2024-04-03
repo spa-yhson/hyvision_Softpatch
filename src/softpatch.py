@@ -3,12 +3,14 @@ import os
 import pickle
 import tqdm
 import time
+import math
 import torch
 import torch.nn as nn
 import src.common as common
 import src.sampler as sampler
 import src.multi_variate_gaussian as multi_variate_gaussian
 from argparse import ArgumentParser, Namespace
+import src.metrics as metrics
 from sklearn.neighbors import LocalOutlierFactor
 import src.backbones as backbones
 from src.fod import FOD
@@ -38,6 +40,7 @@ class SoftPatch(torch.nn.Module):
         patchstride=1,
         anomaly_score_num_nn=1,
         with_fod = False,
+        clip_encoder = False,
         cur_class_name=None,
         featuresampler=sampler.ApproximateGreedyCoresetSampler(percentage=0.1, device=torch.device("cuda")),
         nn_method=common.FaissNN(False, 4),
@@ -51,6 +54,7 @@ class SoftPatch(torch.nn.Module):
         self.layers_to_extract_from = layers_to_extract_from
         self.input_shape = input_shape
         self.with_fod = with_fod # chgd
+        self.clip_encoder = clip_encoder
         self.device = device
         self.patch_maker = PatchMaker(patchsize, stride=patchstride)
 
@@ -97,6 +101,35 @@ class SoftPatch(torch.nn.Module):
         self.weight_method = weight_method
         self.soft_weight_flag = soft_weight_flag
         
+        if self.clip_encoder:
+            import clip
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.clip_model, preprocess = clip.load("ViT-B/32", device=device)
+            
+            self.upsample_1 = nn.Sequential(
+                nn.Linear(512, 512*28*28),
+                nn.ReLU(),
+            ).to(device)
+            self.upsample_2 = nn.Sequential(
+                nn.Linear(512, 1024*14*14),
+                nn.ReLU(),
+            ).to(device)
+            
+            self.auroc_file_name = 'auroc_dict_10n_50e_clip.pkl' # pkl
+            if os.path.exists(self.auroc_file_name):
+                with open(self.auroc_file_name, 'rb') as file:
+                    self.final_output_dict = pickle.load(file)
+            else:
+                self.final_output_dict = {}
+            
+            params = list(self.upsample_1.parameters())
+            params += list(self.upsample_2.parameters())
+            
+            self.optimizer = torch.optim.Adam(params, lr=1e-3)
+            self.PIX_LOSS = nn.MSELoss()
+            self.IMG_LOSS = nn.CrossEntropyLoss()
+            
+        
         if self.with_fod:
             models = []
             feat_dims = [512, 1024]
@@ -127,6 +160,16 @@ class SoftPatch(torch.nn.Module):
             self.optimizer = torch.optim.Adam(params, lr=self.args.lr)
             self.l2_criterion = nn.MSELoss()
             self.cos_criterion = nn.CosineSimilarity(dim=-1)
+            
+            self.auroc_file_name = 'auroc_dict_10n_50e_fod-test.pkl' # pkl
+            
+            if os.path.exists(self.auroc_file_name):
+                #print("File exists.")
+                with open(self.auroc_file_name, 'rb') as file:
+                    self.final_output_dict = pickle.load(file)
+            else:
+                #print("File does not exist.")
+                self.final_output_dict = {}
         
 
     def embed(self, data):
@@ -151,11 +194,19 @@ class SoftPatch(torch.nn.Module):
         _ = self.forward_modules["feature_aggregator"].eval()
         
         
-        with torch.no_grad():
-            # images: (8, 3, 224, 224)
-            features = self.forward_modules["feature_aggregator"](images) # [8, 512, 28, 28]) & [8, 1024, 14, 14]
+        # CLIP Encoder
+        if self.clip_encoder:
+            with torch.no_grad():
+                image_features = self.clip_model.encode_image(images)
+            img_feat1 = self.upsample_1(image_features.to(torch.float32)).reshape(images.shape[0], 512, 28, 28)
+            img_feat2 = self.upsample_2(image_features.to(torch.float32)).reshape(images.shape[0], 1024, 14, 14)
+            features = [img_feat1, img_feat2]
+        else:
+            with torch.no_grad():
+                # images: (B, 3, 224, 224)
+                features = self.forward_modules["feature_aggregator"](images) # [B, 512, 28, 28]) & [B, 1024, 14, 14]
             
-        features = [features[layer] for layer in self.layers_to_extract_from]
+            features = [features[layer] for layer in self.layers_to_extract_from]
         
         # chgd        
         if with_fod:
@@ -246,23 +297,21 @@ class SoftPatch(torch.nn.Module):
                     loss.backward()
                 else:
                     # Two-stage optimization
-                    # loss1.requires_grad_(True) # chgd
-                    # loss2.requires_grad_(True) # chgd
-                    
                     loss1.backward(retain_graph=True)
                     loss2.backward()
                 self.optimizer.step()
 
 
-        # from here is original
+        # from here is original process
         features = [
-            self.patch_maker.patchify(x, return_spatial_info=True) for x in features
+            self.patch_maker.patchify(x, return_spatial_info=True) for x in features # [6, 512, 28, 28] & [6, 1024, 14, 14]
         ]
-        patch_shapes = [x[1] for x in features]
+        
+        patch_shapes = [x[1] for x in features] # [6, 784, 512, 3, 3] & [6, 196, 1024, 3, 3]
         features = [x[0] for x in features]
-        ref_num_patches = patch_shapes[0]
+        ref_num_patches = patch_shapes[0] # [[28, 28], [14, 14]]
 
-        for i in range(1, len(features)):
+        for i in range(1, len(features)): # [6, 196, 1024, 3, 3]
             _features = features[i]
             patch_dims = patch_shapes[i]
 
@@ -293,27 +342,30 @@ class SoftPatch(torch.nn.Module):
         features = self.forward_modules["preadapt_aggregator"](features)
         
         if with_fod:
-            return _detach(features), loss_rec_list, loss_target_list, loss_corr_list, loss_intra_entropy_list, loss_inter_entropy_list
-            
+            return features, loss_rec_list, loss_target_list, loss_corr_list, loss_intra_entropy_list, loss_inter_entropy_list
+        
+        #if self.clip_encoder:
+        #    return features
+        
         else:
             if provide_patch_shapes:
                 return _detach(features), patch_shapes
             return _detach(features)
 
-    def fit(self, training_data, with_fod=False):
+    def fit(self, training_data, with_fod=False, test_data=None):
         """
         This function computes the embeddings of the training data and fills the
         memory bank of SPADE.
-        """        
-        self._fill_memory_bank(training_data, with_fod)
+        """
+        self._fill_memory_bank(training_data, with_fod, test_data)
         
 
-    def _fill_memory_bank(self, input_data, with_fod=False):
+    def _fill_memory_bank(self, input_data, with_fod=False, test_data=None):
         """Computes and sets the support features for SPADE."""
         _ = self.forward_modules.eval()
 
         def _image_to_features(input_image, train_steps=None):
-            if with_fod:
+            if with_fod or self.clip_encoder:
                 input_image = input_image.to(torch.float).to(self.device)
                 return self._embed(input_image, with_fod=with_fod, train_steps=train_steps)
             else:
@@ -324,10 +376,12 @@ class SoftPatch(torch.nn.Module):
         features = []
         
         if with_fod:
-            num_epochs = 20
+            num_epochs = 50
+            self.final_output_dict[input_data.name + '_img_auroc'] = -math.inf
+            self.final_output_dict[input_data.name + '_pix_auroc'] = -math.inf
+            
             for epoch in range(num_epochs):
                 features = []
-                
                 with tqdm.tqdm(
                     input_data, desc="Computing support features...", leave=True
                 ) as data_iterator:
@@ -344,6 +398,174 @@ class SoftPatch(torch.nn.Module):
                         epoch + 1, len(data_iterator), np.average(loss_rec_list), np.average(loss_target_list), np.average(loss_corr_list), np.average(loss_intra_entropy_list), np.average(loss_inter_entropy_list)))
                     
                     
+                features = np.concatenate(features, axis=0)
+                with torch.no_grad():
+                    self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[1][0]
+                    patch_weight = self._compute_patch_weight(features)
+
+                    # normalization
+                    # patch_weight = (patch_weight - patch_weight.quantile(0.5, dim=1, keepdim=True)).reshape(-1) + 1
+
+                    patch_weight = patch_weight.reshape(-1)
+                    threshold = torch.quantile(patch_weight, 1 - self.threshold)
+                    sampling_weight = torch.where(patch_weight > threshold, 0, 1)
+                    self.featuresampler.set_sampling_weight(sampling_weight)
+                    self.patch_weight = patch_weight.clamp(min=0)
+
+                    sample_features, sample_indices = self.featuresampler.run(features)
+                    features = sample_features
+                    self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
+
+                self.anomaly_scorer.fit(detection_features=[features])
+                
+                # Inference start
+                aggregator = {"scores": [], "segmentations": []}
+                scores, segmentations, labels_gt, masks_gt = self.predict(test_data)
+                aggregator["scores"].append(scores)
+                aggregator["segmentations"].append(segmentations)
+                scores = np.array(aggregator["scores"])
+                min_scores = scores.min(axis=-1).reshape(-1, 1)
+                max_scores = scores.max(axis=-1).reshape(-1, 1)
+                scores = (scores - min_scores) / (max_scores - min_scores + 1e-5)
+                scores = np.mean(scores, axis=0)
+
+                segmentations = np.array(aggregator["segmentations"])
+                min_scores = (
+                    segmentations.reshape(len(segmentations), -1)
+                    .min(axis=-1)
+                    .reshape(-1, 1, 1, 1)
+                )
+                max_scores = (
+                    segmentations.reshape(len(segmentations), -1)
+                    .max(axis=-1)
+                    .reshape(-1, 1, 1, 1)
+                )
+                segmentations = (segmentations - min_scores) / (max_scores - min_scores)
+                segmentations = np.mean(segmentations, axis=0)
+                
+                LOGGER.info("Computing evaluation metrics.")
+                auroc = metrics.compute_imagewise_retrieval_metrics(
+                    scores, labels_gt
+                )["auroc"]
+                
+                # Compute PRO score & PW Auroc for all images
+                pixel_scores = metrics.compute_pixelwise_retrieval_metrics(
+                    segmentations, masks_gt
+                )
+                full_pixel_auroc = pixel_scores["auroc"]
+                
+                print("image_auroc:", auroc)
+                print("pixel_auroc:", full_pixel_auroc)
+                print("--------------------------------------")
+                
+                if auroc > self.final_output_dict[input_data.name + '_img_auroc']:
+                    self.final_output_dict[input_data.name + '_img_auroc'] = auroc
+                if auroc > self.final_output_dict[input_data.name + '_pix_auroc']:
+                    self.final_output_dict[input_data.name + '_pix_auroc'] = full_pixel_auroc
+                    
+                    # Saving the dictionary to a pickle file
+                    with open(self.auroc_file_name, 'wb') as file:
+                        pickle.dump(self.final_output_dict, file)
+                
+            print("Output: ",self.final_output_dict)
+        
+        elif self.clip_encoder:
+            num_epochs = 50
+            self.final_output_dict[input_data.name + '_img_auroc'] = -math.inf
+            self.final_output_dict[input_data.name + '_pix_auroc'] = -math.inf
+            
+            for epoch in range(num_epochs):
+                features = []
+                with tqdm.tqdm(
+                    input_data, desc="Computing support features...", leave=True
+                ) as data_iterator:
+                    for image in data_iterator:
+                        if isinstance(image, dict):
+                            image = image["image"]
+                        features.append(_image_to_features(image))
+                        
+                        #tmp_img = _image_to_features(image)
+                        #image = [x.cpu().numpy() for x in tmp_img]
+                        #features.append(image)
+                
+                features = np.concatenate(features, axis=0)
+                
+                #with torch.no_grad():
+                self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[1][0]
+                patch_weight = self._compute_patch_weight(features)
+                patch_weight = patch_weight.reshape(-1)
+                threshold = torch.quantile(patch_weight, 1 - self.threshold)
+                sampling_weight = torch.where(patch_weight > threshold, 0, 1)
+                self.featuresampler.set_sampling_weight(sampling_weight)
+                self.patch_weight = patch_weight.clamp(min=0)
+
+                sample_features, sample_indices = self.featuresampler.run(features)
+                features = sample_features
+                self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
+
+                self.anomaly_scorer.fit(detection_features=[features])
+                # Inference start
+                aggregator = {"scores": [], "segmentations": []}
+                scores, segmentations, labels_gt, masks_gt = self.predict(test_data)
+                aggregator["scores"].append(scores)
+                aggregator["segmentations"].append(segmentations)
+                scores = np.array(aggregator["scores"])
+                min_scores = scores.min(axis=-1).reshape(-1, 1)
+                max_scores = scores.max(axis=-1).reshape(-1, 1)
+                scores = (scores - min_scores) / (max_scores - min_scores + 1e-5)
+                scores = np.mean(scores, axis=0)
+
+                segmentations = np.array(aggregator["segmentations"])
+                min_scores = (
+                    segmentations.reshape(len(segmentations), -1)
+                    .min(axis=-1)
+                    .reshape(-1, 1, 1, 1)
+                )
+                max_scores = (
+                    segmentations.reshape(len(segmentations), -1)
+                    .max(axis=-1)
+                    .reshape(-1, 1, 1, 1)
+                )
+                segmentations = (segmentations - min_scores) / (max_scores - min_scores)
+                segmentations = np.mean(segmentations, axis=0)
+                
+                LOGGER.info("Computing evaluation metrics.")
+                auroc = metrics.compute_imagewise_retrieval_metrics(
+                    scores, labels_gt
+                )["auroc"]
+                
+                # Compute PRO score & PW Auroc for all images
+                pixel_scores = metrics.compute_pixelwise_retrieval_metrics(
+                    segmentations, masks_gt
+                )
+                full_pixel_auroc = pixel_scores["auroc"]
+                
+                print("image_auroc:", auroc)
+                print("pixel_auroc:", full_pixel_auroc)
+                print("--------------------------------------")
+                
+                cls_loss = self.IMG_LOSS(torch.tensor(scores).float(), torch.tensor(labels_gt).float())
+                pix_loss = self.PIX_LOSS(torch.tensor(segmentations), torch.tensor(masks_gt).squeeze(1))
+                
+                print(f"img_loss: {cls_loss}  pix_loss: {pix_loss}")
+                
+                self.optimizer.zero_grad()
+                cls_loss.backward()
+                pix_loss.backward()
+                self.optimizer.step()
+                
+                if auroc > self.final_output_dict[input_data.name + '_img_auroc']:
+                    self.final_output_dict[input_data.name + '_img_auroc'] = auroc
+                if auroc > self.final_output_dict[input_data.name + '_pix_auroc']:
+                    self.final_output_dict[input_data.name + '_pix_auroc'] = full_pixel_auroc
+                    
+                    # Saving the dictionary to a pickle file
+                    with open(self.auroc_file_name, 'wb') as file:
+                        pickle.dump(self.final_output_dict, file)
+                
+            print("Output: ",self.final_output_dict)
+                            
+        
         else: # original
             with tqdm.tqdm(
                 input_data, desc="Computing support features...", leave=True
@@ -352,28 +574,26 @@ class SoftPatch(torch.nn.Module):
                     if isinstance(image, dict):
                         image = image["image"]
                     features.append(_image_to_features(image))
+            
+            features = np.concatenate(features, axis=0)
+            with torch.no_grad():
+                self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[1][0]
+                patch_weight = self._compute_patch_weight(features)
 
-        features = np.concatenate(features, axis=0)
+                # normalization
+                # patch_weight = (patch_weight - patch_weight.quantile(0.5, dim=1, keepdim=True)).reshape(-1) + 1
 
-        with torch.no_grad():
-            # pdb.set_trace()
-            self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[1][0]
-            patch_weight = self._compute_patch_weight(features)
+                patch_weight = patch_weight.reshape(-1)
+                threshold = torch.quantile(patch_weight, 1 - self.threshold)
+                sampling_weight = torch.where(patch_weight > threshold, 0, 1)
+                self.featuresampler.set_sampling_weight(sampling_weight)
+                self.patch_weight = patch_weight.clamp(min=0)
 
-            # normalization
-            # patch_weight = (patch_weight - patch_weight.quantile(0.5, dim=1, keepdim=True)).reshape(-1) + 1
+                sample_features, sample_indices = self.featuresampler.run(features)
+                features = sample_features
+                self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
 
-            patch_weight = patch_weight.reshape(-1)
-            threshold = torch.quantile(patch_weight, 1 - self.threshold)
-            sampling_weight = torch.where(patch_weight > threshold, 0, 1)
-            self.featuresampler.set_sampling_weight(sampling_weight)
-            self.patch_weight = patch_weight.clamp(min=0)
-
-            sample_features, sample_indices = self.featuresampler.run(features)
-            features = sample_features
-            self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
-
-        self.anomaly_scorer.fit(detection_features=[features])
+            self.anomaly_scorer.fit(detection_features=[features])
 
     def _compute_patch_weight(self, features: np.ndarray):
         if isinstance(features, np.ndarray):
@@ -451,7 +671,10 @@ class SoftPatch(torch.nn.Module):
         clf = LocalOutlierFactor(n_neighbors=int(k), metric='l2')
         scores = torch.zeros(size=(patch, batch), device=embedding.device)
         for i in range(patch):
-            clf.fit(embedding[i].cpu())
+            if embedding.requires_grad == True:
+                clf.fit(embedding[i].cpu().detach().numpy())
+            else:
+                clf.fit(embedding[i].cpu())
             scores[i] = torch.Tensor(- clf.negative_outlier_factor_)
             # scores[i] = scores[i] / scores[i].mean()   # normalization
         # embedding = embedding.reshape(patch*batch, channel)

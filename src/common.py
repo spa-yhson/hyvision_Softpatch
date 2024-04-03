@@ -248,6 +248,9 @@ class NetworkFeatureAggregator(torch.nn.Module):
                 else:
                     network_layer = network_layer.__dict__["_modules"][extract_idx]
             else:
+                # if extract_layer[:6] == 'blocks': # chgd
+                #     network_layer = eval(f'backbone.{extract_layer}')
+                # else:
                 network_layer = backbone.__dict__["_modules"][extract_layer]
 
             if isinstance(network_layer, torch.nn.Sequential):

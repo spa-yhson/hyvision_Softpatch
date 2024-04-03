@@ -38,6 +38,10 @@ def parse_args():
     # backbone
     parser.add_argument("--backbone_names", "-b", type=str, action='append', default=['wideresnet50'])
     parser.add_argument("--layers_to_extract_from", "-le", type=str, action='append', default=['layer2', 'layer3'])
+    
+    #parser.add_argument("--backbone_names", "-b", type=str, action='append', default=['vit_small'])
+    #parser.add_argument("--layers_to_extract_from", "-le", type=str, action='append', default=['blocks[2]', 'blocks[3]'])
+    
     # coreset sampler
     parser.add_argument("--sampler_name", type=str, default="approx_greedy_coreset")
     parser.add_argument("--sampling_ratio", type=float, default=0.1)
@@ -60,6 +64,7 @@ def parse_args():
     parser.add_argument("--noise_augmentation", action='store_true')
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--with_fod", action='store_true')
+    parser.add_argument("--clip_encoder", action='store_true')
 
     args = parser.parse_args()
     return args
@@ -75,6 +80,7 @@ def get_dataloaders(args):
     noise_augmentation = args.noise_augmentation
     fold = args.fold
     with_fod = args.with_fod
+    clip_encoder = args.clip_encoder
 
     dataset_info = _DATASETS[args.dataset]
     dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
@@ -127,7 +133,6 @@ def get_dataloaders(args):
             else:
                 test_dataset = Subset(test_dataset, range(len(test_dataset)))
 
-
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -149,7 +154,8 @@ def get_dataloaders(args):
         dataloader_dict = {
             "training": train_dataloader,
             "testing": test_dataloader,
-            "with_fod":with_fod
+            "with_fod":with_fod,
+            "clip_encoder":clip_encoder,
         }
 
         dataloaders.append(dataloader_dict)
@@ -165,7 +171,7 @@ def get_sampler(sampler_name, sampling_ratio, device):
         return sampler.ApproximateGreedyCoresetSampler(sampling_ratio, device)
 
 
-def get_coreset(args, imagesize, sampler, device, with_fod=False):
+def get_coreset(args, imagesize, sampler, device, dataloaders=False):
     input_shape = (3, imagesize, imagesize)
     backbone_names = list(args.backbone_names)
     if len(backbone_names) > 1:
@@ -199,8 +205,9 @@ def get_coreset(args, imagesize, sampler, device, with_fod=False):
             input_shape=input_shape,
             featuresampler=sampler,
             nn_method=nn_method,
-            with_fod=with_fod['with_fod'], # chgd
-            cur_class_name=with_fod['training'].name, #chgd
+            with_fod=dataloaders['with_fod'], # chgd
+            cur_class_name=dataloaders['training'].name, #chgd
+            clip_encoder=dataloaders['clip_encoder'],
             LOF_k=args.lof_k,
             threshold=args.threshold,
             weight_method=args.weight_method,
@@ -244,16 +251,15 @@ def run(args):
         start_time = time.time()
         utils.fix_seeds(seed, device)
 
-
         with device_context:
             torch.cuda.empty_cache()
             sampler = get_sampler(args.sampler_name, args.sampling_ratio, device)
-            coreset_list = get_coreset(args, args.imagesize, sampler, device, with_fod=dataloaders) # chgd
+            coreset_list = get_coreset(args, args.imagesize, sampler, device, dataloaders=dataloaders) # chgd
             if len(coreset_list) > 1:
                 LOGGER.info(
                     "Utilizing Coreset Ensemble (N={}).".format(len(coreset_list))
                 )
-            for i, coreset in enumerate(coreset_list):
+            for i, coreset in enumerate(coreset_list): # This is iterating over model
                 torch.cuda.empty_cache()
                 if coreset.backbone.seed is not None:
                     utils.fix_seeds(coreset.backbone.seed, device)
@@ -262,7 +268,7 @@ def run(args):
                 )
                 # for epoch in range(20):
                 #     coreset._train(dataloaders["training"])
-                coreset.fit(dataloaders["training"], dataloaders['with_fod']) # chgd
+                coreset.fit(dataloaders["training"], dataloaders['with_fod'], dataloaders["testing"]) # chgd (fit starts from here)
             train_end = time.time()
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
