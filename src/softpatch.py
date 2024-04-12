@@ -1,6 +1,7 @@
 import logging
 import os
 import pickle
+import copy
 import tqdm
 import time
 import math
@@ -17,6 +18,10 @@ from src.fod import FOD
 import torch.nn.functional as F
 import numpy as np
 from src.losses import kl_loss, entropy_loss
+import dino.vision_transformer as vits
+from info_nce import InfoNCE, info_nce
+
+
 
 # from torch_cluster import graclus_cluster
 
@@ -27,6 +32,48 @@ class SoftPatch(torch.nn.Module):
     def __init__(self, device):
         super(SoftPatch, self).__init__()
         self.device = device
+        
+    def get_vit_encoder(self, vit_arch, vit_model, vit_patch_size, enc_type_feats):
+        if vit_arch == "vit_small" and vit_patch_size == 16:
+            url = "dino_deitsmall16_pretrain/dino_deitsmall16_pretrain.pth"
+            initial_dim = 384
+        elif vit_arch == "vit_small" and vit_patch_size == 8:
+            url = "dino_deitsmall8_300ep_pretrain/dino_deitsmall8_300ep_pretrain.pth"
+            initial_dim = 384
+        elif vit_arch == "vit_base" and vit_patch_size == 16:
+            if vit_model == "clip":
+                url = "5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f/ViT-B-16.pt"
+            elif vit_model == "dino":
+                url = "dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
+            initial_dim = 768
+        elif vit_arch == "vit_base" and vit_patch_size == 8:
+            url = "dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth"
+            initial_dim = 768
+
+        if vit_model == "dino":
+            vit_encoder = vits.__dict__[vit_arch](patch_size=vit_patch_size, num_classes=0)
+            # TODO change if want to have last layer not unfrozen
+            for p in vit_encoder.parameters():
+                p.requires_grad = False
+            vit_encoder.eval().cuda()  # mode eval
+            state_dict = torch.hub.load_state_dict_from_url(
+                url="https://dl.fbaipublicfiles.com/dino/" + url
+            )
+            vit_encoder.load_state_dict(state_dict, strict=True)
+
+            hook_features = {}
+            if enc_type_feats in ["k", "q", "v", "qkv", "mlp"]:
+                # Define the hook
+                def hook_fn_forward_qkv(module, input, output):
+                    hook_features["qkv"] = output
+
+                vit_encoder._modules["blocks"][-1]._modules["attn"]._modules[
+                    "qkv"
+                ].register_forward_hook(hook_fn_forward_qkv)
+        else:
+            raise ValueError("Not implemented.")
+
+        return vit_encoder, initial_dim, hook_features
 
     def load(
         self,
@@ -41,6 +88,7 @@ class SoftPatch(torch.nn.Module):
         anomaly_score_num_nn=1,
         with_fod = False,
         clip_encoder = False,
+        refine_contrastive = False,
         cur_class_name=None,
         featuresampler=sampler.ApproximateGreedyCoresetSampler(percentage=0.1, device=torch.device("cuda")),
         nn_method=common.FaissNN(False, 4),
@@ -55,6 +103,7 @@ class SoftPatch(torch.nn.Module):
         self.input_shape = input_shape
         self.with_fod = with_fod # chgd
         self.clip_encoder = clip_encoder
+        self.refine_contrastive = refine_contrastive
         self.device = device
         self.patch_maker = PatchMaker(patchsize, stride=patchstride)
 
@@ -102,6 +151,7 @@ class SoftPatch(torch.nn.Module):
         self.soft_weight_flag = soft_weight_flag
         
         if self.clip_encoder:
+            '''
             import clip
             device = "cuda" if torch.cuda.is_available() else "cpu"
             self.clip_model, preprocess = clip.load("ViT-B/32", device=device)
@@ -114,20 +164,45 @@ class SoftPatch(torch.nn.Module):
                 nn.Linear(512, 1024*14*14),
                 nn.ReLU(),
             ).to(device)
+            '''
+            vit_arch = 'vit_small'
+            vit_model = 'dino'
+            self.vit_patch_size = 8
+            self.enc_type_feats = 'k'
             
-            self.auroc_file_name = 'auroc_dict_10n_50e_clip.pkl' # pkl
+            self.vit_encoder, self.initial_dim, self.hook_features = self.get_vit_encoder(
+            vit_arch, vit_model, self.vit_patch_size, self.enc_type_feats)
+            
+            self.vit_encoder = self.vit_encoder.cuda()
+            
+            self.auroc_file_name = 'auroc_dict_10n_50e_dino_contrastive.pkl' # pkl
             if os.path.exists(self.auroc_file_name):
                 with open(self.auroc_file_name, 'rb') as file:
                     self.final_output_dict = pickle.load(file)
             else:
                 self.final_output_dict = {}
+        
+        
+        if refine_contrastive:
+            class OneByOneConvNet(nn.Module):
+                def __init__(self, in_channels, out_channels):
+                    super(OneByOneConvNet, self).__init__()
+                    self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+                    self.leaky_relu = nn.LeakyReLU(inplace=True)
+
+                def forward(self, x):
+                    x = self.conv(x)
+                    x = self.leaky_relu(x)
+                    return x
+    
+            self.refine_conv = OneByOneConvNet(384, 384).cuda()
             
-            params = list(self.upsample_1.parameters())
-            params += list(self.upsample_2.parameters())
+            params = list(self.refine_conv.conv.parameters())
+            # params += list(self.upsample_2.parameters())
             
             self.optimizer = torch.optim.Adam(params, lr=1e-3)
-            self.PIX_LOSS = nn.MSELoss()
-            self.IMG_LOSS = nn.CrossEntropyLoss()
+            self.CONTRASTIVE_LOSS = InfoNCE()
+            # self.IMG_LOSS = nn.CrossEntropyLoss()
             
         
         if self.with_fod:
@@ -135,7 +210,7 @@ class SoftPatch(torch.nn.Module):
             feat_dims = [512, 1024]
             self.seq_lens = [784, 196]
             self.ws = [28, 14]  # feature map height/width
-            args = Namespace(batch_size=8, device=device, with_intra=True, with_inter=True, rfeatures_path='rfeatures_w50',\
+            args = Namespace(batch_size=8, device=device, with_intra=False, with_inter=True, rfeatures_path='rfeatures_w50',\
                 class_name=cur_class_name, feature_levels=len(feat_dims), save_path='checkpoints', save_prefix='mvtec', num_epochs=100,\
                     lr=0.0001, lambda1=0.5, lambda2=0.5) # args chgd here!
             self.args = args
@@ -161,7 +236,7 @@ class SoftPatch(torch.nn.Module):
             self.l2_criterion = nn.MSELoss()
             self.cos_criterion = nn.CosineSimilarity(dim=-1)
             
-            self.auroc_file_name = 'auroc_dict_10n_50e_fod-test.pkl' # pkl
+            self.auroc_file_name = 'auroc_dict_10n_50e_fod_inter.pkl' # pkl
             
             if os.path.exists(self.auroc_file_name):
                 #print("File exists.")
@@ -170,6 +245,30 @@ class SoftPatch(torch.nn.Module):
             else:
                 #print("File does not exist.")
                 self.final_output_dict = {}
+    
+    
+    @torch.no_grad()
+    def extract_feats(self, dims, type_feats="k"):
+
+        nb_im, nh, nb_tokens, _ = dims
+        qkv = (
+            self.hook_features["qkv"]
+            .reshape(
+                nb_im, nb_tokens, 3, nh, -1 // nh
+            )  # 3 corresponding to |qkv|
+            .permute(2, 0, 3, 1, 4)
+        )
+
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        if type_feats == "q":
+            return q.transpose(1, 2).float()
+        elif type_feats == "k":
+            return k.transpose(1, 2).float()
+        elif type_feats == "v":
+            return v.transpose(1, 2).float()
+        else:
+            raise ValueError("Unknown features")
         
 
     def embed(self, data):
@@ -197,10 +296,25 @@ class SoftPatch(torch.nn.Module):
         # CLIP Encoder
         if self.clip_encoder:
             with torch.no_grad():
-                image_features = self.clip_model.encode_image(images)
-            img_feat1 = self.upsample_1(image_features.to(torch.float32)).reshape(images.shape[0], 512, 28, 28)
-            img_feat2 = self.upsample_2(image_features.to(torch.float32)).reshape(images.shape[0], 1024, 14, 14)
-            features = [img_feat1, img_feat2]
+                w_featmap = images.shape[-2] // self.vit_patch_size 
+                h_featmap = images.shape[-1] // self.vit_patch_size 
+                att = self.vit_encoder.get_last_selfattention(images) 
+            
+                # Get decoder features
+                feats = self.extract_feats(dims=att.shape, type_feats='k') 
+                feats = feats[:, 1:, :, :].reshape(att.shape[0], w_featmap, h_featmap, -1) 
+                feats = feats.permute(0, 3, 1, 2) # [B, 384, 28, 28]
+                
+                if self.refine_contrastive:
+                    feats_refine = self.refine_conv(feats.clone())
+            
+            features = [feats]
+                
+            #     image_features = self.clip_model.encode_image(images)
+            # img_feat1 = self.upsample_1(image_features.to(torch.float32)).reshape(images.shape[0], 512, 28, 28)
+            # img_feat2 = self.upsample_2(image_features.to(torch.float32)).reshape(images.shape[0], 1024, 14, 14)
+            # features = [img_feat1, img_feat2]
+            
         else:
             with torch.no_grad():
                 # images: (B, 3, 224, 224)
@@ -312,7 +426,7 @@ class SoftPatch(torch.nn.Module):
         ref_num_patches = patch_shapes[0] # [[28, 28], [14, 14]]
 
         for i in range(1, len(features)): # [6, 196, 1024, 3, 3]
-            _features = features[i]
+            _features = features[i] # 
             patch_dims = patch_shapes[i]
 
             _features = _features.reshape(
@@ -342,10 +456,10 @@ class SoftPatch(torch.nn.Module):
         features = self.forward_modules["preadapt_aggregator"](features)
         
         if with_fod:
-            return features, loss_rec_list, loss_target_list, loss_corr_list, loss_intra_entropy_list, loss_inter_entropy_list
+            return _detach(features), loss_rec_list, loss_target_list, loss_corr_list, loss_intra_entropy_list, loss_inter_entropy_list
         
-        #if self.clip_encoder:
-        #    return features
+        if self.refine_contrastive:
+           return _detach(features), feats_refine, patch_shapes
         
         else:
             if provide_patch_shapes:
@@ -365,7 +479,7 @@ class SoftPatch(torch.nn.Module):
         _ = self.forward_modules.eval()
 
         def _image_to_features(input_image, train_steps=None):
-            if with_fod or self.clip_encoder:
+            if with_fod or self.clip_encoder or self.refine_contrastive:
                 input_image = input_image.to(torch.float).to(self.device)
                 return self._embed(input_image, with_fod=with_fod, train_steps=train_steps)
             else:
@@ -469,41 +583,116 @@ class SoftPatch(torch.nn.Module):
                 
             print("Output: ",self.final_output_dict)
         
-        elif self.clip_encoder:
+        elif self.refine_contrastive:
             num_epochs = 50
             self.final_output_dict[input_data.name + '_img_auroc'] = -math.inf
             self.final_output_dict[input_data.name + '_pix_auroc'] = -math.inf
             
             for epoch in range(num_epochs):
                 features = []
+                refine_features = []
+                labels_gt = []
+                masks_gt = []
+                num_data = []
                 with tqdm.tqdm(
                     input_data, desc="Computing support features...", leave=True
                 ) as data_iterator:
-                    for image in data_iterator:
+                    for idx, image in enumerate(data_iterator):
+                        
+                        labels_gt.extend(image["is_anomaly"].numpy().tolist())
+                        masks_gt.extend(image["mask"].numpy().tolist())
+                        
                         if isinstance(image, dict):
                             image = image["image"]
-                        features.append(_image_to_features(image))
+
+                        tmp_img, refine_feats, _ = _image_to_features(image)
                         
-                        #tmp_img = _image_to_features(image)
+                        refine_features.append(refine_feats)
+                        features.append(tmp_img)
+                        num_data.append(len(features[idx]))
+                        
                         #image = [x.cpu().numpy() for x in tmp_img]
                         #features.append(image)
-                
-                features = np.concatenate(features, axis=0)
-                
-                #with torch.no_grad():
-                self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[1][0]
-                patch_weight = self._compute_patch_weight(features)
-                patch_weight = patch_weight.reshape(-1)
-                threshold = torch.quantile(patch_weight, 1 - self.threshold)
-                sampling_weight = torch.where(patch_weight > threshold, 0, 1)
-                self.featuresampler.set_sampling_weight(sampling_weight)
-                self.patch_weight = patch_weight.clamp(min=0)
 
-                sample_features, sample_indices = self.featuresampler.run(features)
-                features = sample_features
-                self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
+                    tmp_img_feats = np.concatenate(features, axis=0)
+                    tmp_img_feats_org = copy.deepcopy(tmp_img_feats)
+                    #tmp_img_feats_refine = np.concatenate(refine_features, axis=0)
+                    
+                    with torch.no_grad():
+                        self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[2][0]
+                        patch_weight = self._compute_patch_weight(tmp_img_feats) ##
+                        patch_weight = patch_weight.reshape(-1)
+                        threshold = torch.quantile(patch_weight, 1 - self.threshold)
+                        sampling_weight = torch.where(patch_weight > threshold, 0, 1)
+                        self.featuresampler.set_sampling_weight(sampling_weight)
+                        self.patch_weight = patch_weight.clamp(min=0)
+                        sample_features, sample_indices = self.featuresampler.run(tmp_img_feats)
+                        tmp_img_feats = sample_features
+                        self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
 
-                self.anomaly_scorer.fit(detection_features=[features])
+                    self.anomaly_scorer.fit(detection_features=[tmp_img_feats])
+                
+                    num_of_inference = len(data_iterator)
+                    
+                    org_all_scores = []
+                    all_scores = []
+                    for idx in range(num_of_inference):
+                        scores, segmentations = self.predict_train(torch.tensor(tmp_img_feats_org[num_data[idx]*idx : num_data[idx]*(idx+1)]))
+                        scores = np.array(scores)
+                        breakpoint()
+                        min_scores = scores.min(axis=-1).reshape(-1, 1)
+                        max_scores = scores.max(axis=-1).reshape(-1, 1)
+                        scores = (scores - min_scores) / (max_scores - min_scores + 1e-5)
+                        scores = np.mean(scores, axis=0)
+                        breakpoint()
+                        
+                        
+                        # Binarize scores into gt
+                        bi_score = []
+                        for score in scores:
+                            if score <=0.5:
+                                bi_score.append(0)
+                            else:
+                                bi_score.append(1)
+                        all_scores.append([bi_score])
+                    
+                    #breakpoint()
+                    # for idx in range(num_of_inference):
+                    #     scores, segmentations = self.predict_train(torch.tensor(tmp_img_feats_org[num_data[idx]*idx:num_data[idx]*(idx+1)]))
+                        #labels_gt.extend(input_data["is_anomaly"].numpy().tolist())
+                        #masks_gt.extend(input_data["mask"].numpy().tolist())
+                        #cls_loss = self.IMG_LOSS(torch.tensor(scores, requires_grad = True).float(), torch.tensor(labels_gt)[6*idx:6*(idx+1)].float())
+                        #pix_loss = self.PIX_LOSS(torch.tensor(segmentations, requires_grad = True), torch.tensor(masks_gt)[6*idx:6*(idx+1)].squeeze(1))
+                    
+                    # query = []
+                    # pos_key = []
+                    # neg_key = []
+                    # final_label_gt = []
+                    # tmp_label_list = []
+                    # for idx in range(num_of_inference):
+                    #     if idx == len(num_data) - 1:
+                    #         tmp_img = torch.tensor(tmp_img_feats_org[num_data[idx-1]*idx:num_data[idx-1]*(idx+1) - (num_data[idx-1] - num_data[idx])])
+                    #     else:
+                    #         tmp_img = torch.tensor(tmp_img_feats_org[num_data[idx]*idx:num_data[idx]*(idx+1)])
+                            
+                    #     tmp_label = sum(final_label_gt[idx])
+                        
+                    #     if tmp_label == 0:
+                    #         pos_key.append(tmp_img)
+                    #     if tmp_label == len(final_label_gt[0]):
+                    #         neg_key.append(tmp_img)
+                        
+                    #     breakpoint()
+                        
+                    
+                    # contra_loss = self.CONTRASTIVE_LOSS(query, pos_key, neg_key)
+                    
+                    # print(f"contrastive_loss: {contra_loss}")
+                    
+                    # self.optimizer.zero_grad()
+                    # contra_loss.backward()
+                    # self.optimizer.step()
+                
                 # Inference start
                 aggregator = {"scores": [], "segmentations": []}
                 scores, segmentations, labels_gt, masks_gt = self.predict(test_data)
@@ -529,6 +718,7 @@ class SoftPatch(torch.nn.Module):
                 segmentations = (segmentations - min_scores) / (max_scores - min_scores)
                 segmentations = np.mean(segmentations, axis=0)
                 
+                
                 LOGGER.info("Computing evaluation metrics.")
                 auroc = metrics.compute_imagewise_retrieval_metrics(
                     scores, labels_gt
@@ -543,16 +733,6 @@ class SoftPatch(torch.nn.Module):
                 print("image_auroc:", auroc)
                 print("pixel_auroc:", full_pixel_auroc)
                 print("--------------------------------------")
-                
-                cls_loss = self.IMG_LOSS(torch.tensor(scores).float(), torch.tensor(labels_gt).float())
-                pix_loss = self.PIX_LOSS(torch.tensor(segmentations), torch.tensor(masks_gt).squeeze(1))
-                
-                print(f"img_loss: {cls_loss}  pix_loss: {pix_loss}")
-                
-                self.optimizer.zero_grad()
-                cls_loss.backward()
-                pix_loss.backward()
-                self.optimizer.step()
                 
                 if auroc > self.final_output_dict[input_data.name + '_img_auroc']:
                     self.final_output_dict[input_data.name + '_img_auroc'] = auroc
@@ -575,9 +755,10 @@ class SoftPatch(torch.nn.Module):
                         image = image["image"]
                     features.append(_image_to_features(image))
             
-            features = np.concatenate(features, axis=0)
+            
+            features = np.concatenate(features, axis=0) # (163856, 1024)
             with torch.no_grad():
-                self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[1][0]
+                self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[1][0]                
                 patch_weight = self._compute_patch_weight(features)
 
                 # normalization
@@ -730,6 +911,46 @@ class SoftPatch(torch.nn.Module):
         chunk_lof_mat = chunk_lof_mat.transpose(1, 2).reshape(width, height, batch)
         return chunk_lof_mat
 
+    
+    def predict_train(self, data):
+        return self._predict_train(data)
+    
+    
+    def _predict_train(self, features):
+        """Infer score and mask for a batch of images."""
+        #images = images.to(torch.float).to(self.device)
+        _ = self.forward_modules.train()
+        
+        batchsize, _, _, _ = features.reshape(-1, 28, 28, 1024).shape
+
+        #features, patch_shapes = self._embed(images, provide_patch_shapes=True)
+        features = np.asarray(features)
+        
+        image_scores, _, indices = self.anomaly_scorer.predict([features])
+        if self.soft_weight_flag:
+            indices = indices.squeeze()
+            # indices = torch.tensor(indices).to(self.device)
+            weight = np.take(self.coreset_weight, axis=0, indices=indices)
+            image_scores = image_scores * weight
+
+        patch_scores = image_scores
+        
+        image_scores = self.patch_maker.unpatch_scores(
+            image_scores, batchsize=batchsize
+        )
+        image_scores = image_scores.reshape(*image_scores.shape[:2], -1) # [6, 784, 1]
+        image_scores = self.patch_maker.score(image_scores)
+
+        patch_scores = self.patch_maker.unpatch_scores(
+            patch_scores, batchsize=batchsize
+        )
+        scales = [28, 28] #patch_shapes[0]
+        patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1]) # [6, 28, 28]
+
+        masks = self.anomaly_segmentor.convert_to_segmentation(patch_scores)
+
+        return [score for score in image_scores], [mask for mask in masks]
+    
 
     def predict(self, data):
         if isinstance(data, torch.utils.data.DataLoader):
@@ -763,8 +984,13 @@ class SoftPatch(torch.nn.Module):
 
         batchsize = images.shape[0]
         with torch.no_grad():
-            features, patch_shapes = self._embed(images, provide_patch_shapes=True)
-            features = np.asarray(features)
+            if self.refine_contrastive:
+                features, refine_feats, patch_shapes = self._embed(images, provide_patch_shapes=True)
+            
+            else:
+                features, patch_shapes = self._embed(images, provide_patch_shapes=True)
+            
+            features = np.asarray(features) # (4704, 1024)
 
             image_scores, _, indices = self.anomaly_scorer.predict([features])
             if self.soft_weight_flag:

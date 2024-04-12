@@ -42,6 +42,7 @@ class Attention2D(nn.Module):
         
         if return_attention:  # the sigma will be learned in the intra and inter correlation branches
             sigma = self.sigma_projection(query).view(B, L, self.num_heads, -1)
+        
         query = self.query_projection(query).view(B, L, self.num_heads, -1)
         key = self.key_projection(key).view(B, S, self.num_heads, -1)
         value = self.value_projection(value).view(B, S, self.num_heads, -1)

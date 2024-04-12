@@ -59,7 +59,7 @@ class EncoderLayer(nn.Module):
             )
             new_x = x + self.dropout(new_x)
 
-            if x.shape[0] != 8: # chgd
+            if x.shape[0] != ref_x.shape[0]: # chgd
                 ref_x = ref_x[:x.shape[0]]
             
             new_ref_x, inter_corr, inter_target = self.cross_attention(
@@ -72,6 +72,9 @@ class EncoderLayer(nn.Module):
             # new_x = torch.cat([new_x, ref_x], dim=-1)
             # new_x = self.ffn_proj(new_x)
         elif with_inter:  # only inter correlation
+            if x.shape[0] != ref_x.shape[0]: # chgd
+                ref_x = ref_x[:x.shape[0]]
+                
             new_x, inter_corr, inter_target = self.cross_attention(
                 x, ref_x, ref_x,
                 return_attention=True

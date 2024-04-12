@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--with_fod", action='store_true')
     parser.add_argument("--clip_encoder", action='store_true')
+    parser.add_argument("--refine_contrastive", action='store_true')
 
     args = parser.parse_args()
     return args
@@ -81,6 +82,7 @@ def get_dataloaders(args):
     fold = args.fold
     with_fod = args.with_fod
     clip_encoder = args.clip_encoder
+    refine_contrastive = args.refine_contrastive
 
     dataset_info = _DATASETS[args.dataset]
     dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
@@ -156,6 +158,7 @@ def get_dataloaders(args):
             "testing": test_dataloader,
             "with_fod":with_fod,
             "clip_encoder":clip_encoder,
+            "refine_contrastive":refine_contrastive,
         }
 
         dataloaders.append(dataloader_dict)
@@ -208,6 +211,7 @@ def get_coreset(args, imagesize, sampler, device, dataloaders=False):
             with_fod=dataloaders['with_fod'], # chgd
             cur_class_name=dataloaders['training'].name, #chgd
             clip_encoder=dataloaders['clip_encoder'],
+            refine_contrastive=dataloaders['refine_contrastive'],
             LOF_k=args.lof_k,
             threshold=args.threshold,
             weight_method=args.weight_method,
