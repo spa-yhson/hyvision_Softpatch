@@ -195,7 +195,7 @@ class SoftPatch(torch.nn.Module):
                     x = self.leaky_relu(x)
                     return x
     
-            self.refine_conv = OneByOneConvNet(384, 384).cuda()
+            self.refine_conv = OneByOneConvNet(384, 1024).cuda()
             
             params = list(self.refine_conv.conv.parameters())
             # params += list(self.upsample_2.parameters())
@@ -305,8 +305,9 @@ class SoftPatch(torch.nn.Module):
                 feats = feats[:, 1:, :, :].reshape(att.shape[0], w_featmap, h_featmap, -1) 
                 feats = feats.permute(0, 3, 1, 2) # [B, 384, 28, 28]
                 
-                if self.refine_contrastive:
-                    feats_refine = self.refine_conv(feats.clone())
+            if self.refine_contrastive:
+                feats = self.refine_conv(feats.clone())
+                feats_refine = feats.permute(0,2,3,1).reshape(-1, self.target_embed_dimension)
             
             features = [feats]
                 
@@ -449,11 +450,12 @@ class SoftPatch(torch.nn.Module):
             _features = _features.reshape(len(_features), -1, *_features.shape[-3:])
             features[i] = _features
         features = [x.reshape(-1, *x.shape[-3:]) for x in features]
-
+        
         # As different feature backbones & patching provide differently
         # sized features, these are brought into the correct form here.
         features = self.forward_modules["preprocessing"](features)
         features = self.forward_modules["preadapt_aggregator"](features)
+        
         
         if with_fod:
             return _detach(features), loss_rec_list, loss_target_list, loss_corr_list, loss_intra_entropy_list, loss_inter_entropy_list
@@ -594,11 +596,14 @@ class SoftPatch(torch.nn.Module):
                 labels_gt = []
                 masks_gt = []
                 num_data = []
+                num_batches = []
+                batch_size = None
                 with tqdm.tqdm(
                     input_data, desc="Computing support features...", leave=True
                 ) as data_iterator:
                     for idx, image in enumerate(data_iterator):
-                        
+                        if batch_size == None:
+                            batch_size = image['image'].shape[0]
                         labels_gt.extend(image["is_anomaly"].numpy().tolist())
                         masks_gt.extend(image["mask"].numpy().tolist())
                         
@@ -610,88 +615,106 @@ class SoftPatch(torch.nn.Module):
                         refine_features.append(refine_feats)
                         features.append(tmp_img)
                         num_data.append(len(features[idx]))
+                        num_batches.append(image.shape[0])
                         
-                        #image = [x.cpu().numpy() for x in tmp_img]
-                        #features.append(image)
-
-                    tmp_img_feats = np.concatenate(features, axis=0)
-                    tmp_img_feats_org = copy.deepcopy(tmp_img_feats)
-                    #tmp_img_feats_refine = np.concatenate(refine_features, axis=0)
                     
-                    with torch.no_grad():
-                        self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[2][0]
-                        patch_weight = self._compute_patch_weight(tmp_img_feats) ##
-                        patch_weight = patch_weight.reshape(-1)
-                        threshold = torch.quantile(patch_weight, 1 - self.threshold)
-                        sampling_weight = torch.where(patch_weight > threshold, 0, 1)
-                        self.featuresampler.set_sampling_weight(sampling_weight)
-                        self.patch_weight = patch_weight.clamp(min=0)
-                        sample_features, sample_indices = self.featuresampler.run(tmp_img_feats)
-                        tmp_img_feats = sample_features
-                        self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
+                    tmp_img_feats_refine = torch.cat(refine_features).clone()
+                    tmp_img_feats = np.concatenate([x.detach().cpu().numpy() for x in refine_features], axis=0)
+                    #tmp_img_feats_org = np.concatenate(features, axis=0)
+                    
+                    #with torch.no_grad():
+                    self.feature_shape = self._embed(image.to(torch.float).to(self.device), provide_patch_shapes=True)[2][0]
+                    patch_weight = self._compute_patch_weight(tmp_img_feats)
+                    patch_weight = patch_weight.reshape(-1)
+                    threshold = torch.quantile(patch_weight, 1 - self.threshold)
+                    sampling_weight = torch.where(patch_weight > threshold, 0, 1)
+                    self.featuresampler.set_sampling_weight(sampling_weight)
+                    self.patch_weight = patch_weight.clamp(min=0)
+                    sample_features, sample_indices = self.featuresampler.run(tmp_img_feats)
+                    tmp_img_feats = sample_features
+                    self.coreset_weight = self.patch_weight[sample_indices].cpu().numpy()
 
                     self.anomaly_scorer.fit(detection_features=[tmp_img_feats])
                 
                     num_of_inference = len(data_iterator)
-                    
                     org_all_scores = []
                     all_scores = []
-                    for idx in range(num_of_inference):
-                        scores, segmentations = self.predict_train(torch.tensor(tmp_img_feats_org[num_data[idx]*idx : num_data[idx]*(idx+1)]))
-                        scores = np.array(scores)
-                        breakpoint()
-                        min_scores = scores.min(axis=-1).reshape(-1, 1)
-                        max_scores = scores.max(axis=-1).reshape(-1, 1)
-                        scores = (scores - min_scores) / (max_scores - min_scores + 1e-5)
-                        scores = np.mean(scores, axis=0)
-                        breakpoint()
+                    
+                    scores, segmentations, labels_gt, masks_gt = self.predict_train(input_data)         
+                    scores = np.array(scores)
+                    
+                    min_scores = scores.min(axis=-1).reshape(-1, 1)
+                    max_scores = scores.max(axis=-1).reshape(-1, 1)
+                    scores = (scores - min_scores) / (max_scores - min_scores + 1e-5)
+                    scores = np.mean(scores, axis=0)
+                    
+                    auroc = metrics.compute_imagewise_retrieval_metrics(scores, labels_gt)["auroc"]
+                    
+                    segmentations = np.array(segmentations)
+                    min_scores = (
+                        segmentations.reshape(len(segmentations), -1)
+                        .min(axis=-1)
+                        .reshape(-1, 1, 1, 1)
+                    )
+                    max_scores = (
+                        segmentations.reshape(len(segmentations), -1)
+                        .max(axis=-1)
+                        .reshape(-1, 1, 1, 1)
+                    )
+                    segmentations = (segmentations - min_scores) / (max_scores - min_scores)
+                    segmentations = np.mean(segmentations, axis=0)
+                    
+                    pixel_scores = metrics.compute_pixelwise_retrieval_metrics(
+                    segmentations, masks_gt)["auroc"]
+                    print("Img auroc Train: ", auroc)
+                    print("Pix auroc Train: ", pixel_scores)
+                                        
+                    # Loss
+                    query = []
+                    pos_key = []
+                    neg_key = []
+                    channel = tmp_img_feats.shape[-1]
+                    for idx in range(0, len(num_data)):
+                        if idx == len(num_data) - 1:
+                            tmp_img = torch.tensor(tmp_img_feats_refine[num_data[idx-1]*idx : num_data[idx-1]*(idx+1) - (num_data[idx-1] - num_data[idx])], requires_grad=True).reshape(-1, self.feature_shape[0], self.feature_shape[1], channel)
+                            tmp_score = scores[num_batches[idx-1]*idx : num_batches[idx-1]*(idx+1)- (num_batches[idx-1] - num_batches[idx])]
+                        else:
+                            tmp_img = torch.tensor(tmp_img_feats_refine[num_data[idx]*idx:num_data[idx]*(idx+1)], requires_grad=True).reshape(batch_size, self.feature_shape[0], self.feature_shape[1], -1)    
+                            tmp_score = scores[batch_size*idx:batch_size*(idx+1)]
                         
-                        
-                        # Binarize scores into gt
-                        bi_score = []
-                        for score in scores:
-                            if score <=0.5:
-                                bi_score.append(0)
+                        for idx2 in range(len(tmp_score)):
+                            if tmp_score[idx2] < 0.5:
+                                pos_key.append(tmp_img[idx2].reshape(-1, self.target_embed_dimension))
                             else:
-                                bi_score.append(1)
-                        all_scores.append([bi_score])
+                                neg_key.append(tmp_img[idx2].reshape(-1, self.target_embed_dimension))
                     
-                    #breakpoint()
-                    # for idx in range(num_of_inference):
-                    #     scores, segmentations = self.predict_train(torch.tensor(tmp_img_feats_org[num_data[idx]*idx:num_data[idx]*(idx+1)]))
-                        #labels_gt.extend(input_data["is_anomaly"].numpy().tolist())
-                        #masks_gt.extend(input_data["mask"].numpy().tolist())
-                        #cls_loss = self.IMG_LOSS(torch.tensor(scores, requires_grad = True).float(), torch.tensor(labels_gt)[6*idx:6*(idx+1)].float())
-                        #pix_loss = self.PIX_LOSS(torch.tensor(segmentations, requires_grad = True), torch.tensor(masks_gt)[6*idx:6*(idx+1)].squeeze(1))
-                    
-                    # query = []
-                    # pos_key = []
-                    # neg_key = []
-                    # final_label_gt = []
-                    # tmp_label_list = []
-                    # for idx in range(num_of_inference):
-                    #     if idx == len(num_data) - 1:
-                    #         tmp_img = torch.tensor(tmp_img_feats_org[num_data[idx-1]*idx:num_data[idx-1]*(idx+1) - (num_data[idx-1] - num_data[idx])])
-                    #     else:
-                    #         tmp_img = torch.tensor(tmp_img_feats_org[num_data[idx]*idx:num_data[idx]*(idx+1)])
-                            
-                    #     tmp_label = sum(final_label_gt[idx])
+                    # Split pos_key
+                    half_len = len(pos_key) // 2
+                    if half_len % 2 == 0:
+                        query = pos_key[:half_len]
+                        pos_key = pos_key[half_len:]
+                    else:
+                        query = pos_key[:half_len]
+                        pos_key = pos_key[half_len:]
                         
-                    #     if tmp_label == 0:
-                    #         pos_key.append(tmp_img)
-                    #     if tmp_label == len(final_label_gt[0]):
-                    #         neg_key.append(tmp_img)
-                        
-                    #     breakpoint()
-                        
+                    if len(query) > len(pos_key):
+                        diff = len(query) - len(pos_key)
+                        for _ in range(diff):
+                            _ = query.pop(0)
                     
-                    # contra_loss = self.CONTRASTIVE_LOSS(query, pos_key, neg_key)
+                    elif len(query) < len(pos_key):
+                        diff = len(pos_key) - len(query)
+                        for _ in range(diff):
+                            _ = pos_key.pop(0)
                     
-                    # print(f"contrastive_loss: {contra_loss}")
+                    #contra_loss = self.CONTRASTIVE_LOSS(torch.cat(query), torch.cat(pos_key), torch.cat(neg_key))
+                    contra_loss = self.CONTRASTIVE_LOSS(torch.cat(query)[:50], torch.cat(pos_key)[:50])
+
+                    print(f"contrastive_loss: {contra_loss}")
+                    self.optimizer.zero_grad()
+                    contra_loss.backward()
+                    self.optimizer.step()
                     
-                    # self.optimizer.zero_grad()
-                    # contra_loss.backward()
-                    # self.optimizer.step()
                 
                 # Inference start
                 aggregator = {"scores": [], "segmentations": []}
@@ -703,6 +726,7 @@ class SoftPatch(torch.nn.Module):
                 max_scores = scores.max(axis=-1).reshape(-1, 1)
                 scores = (scores - min_scores) / (max_scores - min_scores + 1e-5)
                 scores = np.mean(scores, axis=0)
+                
 
                 segmentations = np.array(aggregator["segmentations"])
                 min_scores = (
@@ -913,39 +937,68 @@ class SoftPatch(torch.nn.Module):
 
     
     def predict_train(self, data):
+        if isinstance(data, torch.utils.data.DataLoader):
+            return self._predict_dataloader_train(data)
         return self._predict_train(data)
     
-    
-    def _predict_train(self, features):
-        """Infer score and mask for a batch of images."""
-        #images = images.to(torch.float).to(self.device)
-        _ = self.forward_modules.train()
-        
-        batchsize, _, _, _ = features.reshape(-1, 28, 28, 1024).shape
+    def _predict_dataloader_train(self, dataloader):
+        """This function provides anomaly scores/maps for full dataloaders."""
+        _ = self.forward_modules.eval()
 
-        #features, patch_shapes = self._embed(images, provide_patch_shapes=True)
-        features = np.asarray(features)
+        scores = []
+        masks = []
+        labels_gt = []
+        masks_gt = []
+        with tqdm.tqdm(dataloader, desc="Inferring...", leave=True) as data_iterator:
+            for image in data_iterator:
+                if isinstance(image, dict):
+                    labels_gt.extend(image["is_anomaly"].numpy().tolist())
+                    masks_gt.extend(image["mask"].numpy().tolist())
+                    image = image["image"]
+                _scores, _masks = self._predict_train(image)
+                for score, mask in zip(_scores, _masks):
+                    scores.append(score)
+                    masks.append(mask)
+        return scores, masks, labels_gt, masks_gt
+    
+    
+    def _predict_train(self, images):
+        """Infer score and mask for a batch of images."""
+        images = images.to(torch.float).to(self.device)
+        _ = self.forward_modules.train()
+
+        batchsize = images.shape[0]
+        #with torch.no_grad():
+        if self.refine_contrastive:
+            features, refine_feats, patch_shapes = self._embed(images, provide_patch_shapes=True)
         
+        else:
+            features, patch_shapes = self._embed(images, provide_patch_shapes=True)
+        
+        features = np.asarray(features) # (4704, 1024)
+
         image_scores, _, indices = self.anomaly_scorer.predict([features])
         if self.soft_weight_flag:
             indices = indices.squeeze()
             # indices = torch.tensor(indices).to(self.device)
             weight = np.take(self.coreset_weight, axis=0, indices=indices)
+
             image_scores = image_scores * weight
+            # image_scores = weight
 
         patch_scores = image_scores
-        
+
         image_scores = self.patch_maker.unpatch_scores(
             image_scores, batchsize=batchsize
         )
-        image_scores = image_scores.reshape(*image_scores.shape[:2], -1) # [6, 784, 1]
+        image_scores = image_scores.reshape(*image_scores.shape[:2], -1)
         image_scores = self.patch_maker.score(image_scores)
 
         patch_scores = self.patch_maker.unpatch_scores(
             patch_scores, batchsize=batchsize
         )
-        scales = [28, 28] #patch_shapes[0]
-        patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1]) # [6, 28, 28]
+        scales = patch_shapes[0]
+        patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1])
 
         masks = self.anomaly_segmentor.convert_to_segmentation(patch_scores)
 

@@ -52,6 +52,7 @@ class GreedyCoresetSampler(BaseSampler):
     def _reduce_features(self, features):
         if features.shape[1] == self.dimension_to_project_features_to:
             return features
+        
         mapper = torch.nn.Linear(
             features.shape[1], self.dimension_to_project_features_to, bias=False
         )
